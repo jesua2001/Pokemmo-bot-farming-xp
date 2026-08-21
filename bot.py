@@ -41,6 +41,7 @@ POLL_INTERVAL = 0.07
 
 BATTLE_MATCH_THRESHOLD = 0.68
 HORDE_MATCH_THRESHOLD = 0.70
+PP_ZERO_MATCH_THRESHOLD = 0.82
 
 TEMPLATE_SCALES = (
     0.55,
@@ -92,6 +93,12 @@ BATTLE_END_TIMEOUT = 8.0
 WORLD_CONFIRMATIONS = 3
 WORLD_CHECK_INTERVAL = 0.15
 
+# Seleccion automatica de movimiento segun PP
+# Offsets relativos al tamano de la ventana cliente.
+MOVE_COLUMN_OFFSET_RATIO = 0.155
+MOVE_ROW_OFFSET_RATIO = 0.073
+PP_CHECK_WAIT = 0.10
+
 
 # =========================================================
 # ARCHIVOS
@@ -105,6 +112,10 @@ BATTLE_TEMPLATE_PATH = (
 
 HORDE_TEMPLATE_PATH = (
     BASE_DIR / "horde_empty.png"
+)
+
+PP_ZERO_TEMPLATE_PATH = (
+    BASE_DIR / "pp_zero.png"
 )
 
 
@@ -146,6 +157,10 @@ BATTLE_TEMPLATE = load_template(
 
 HORDE_TEMPLATE = load_template(
     HORDE_TEMPLATE_PATH
+)
+
+PP_ZERO_TEMPLATE = load_template(
+    PP_ZERO_TEMPLATE_PATH
 )
 
 
@@ -634,6 +649,162 @@ def detect_horde_target(
         HORDE_TEMPLATE,
         HORDE_MATCH_THRESHOLD,
     )
+
+
+# =========================================================
+# PP DE MOVIMIENTOS
+# =========================================================
+
+def get_move_positions(
+    first_x: int,
+    first_y: int,
+    move_size: tuple[int, int],
+) -> list[tuple[int, int]]:
+
+    move_w, move_h = move_size
+
+    # Los 4 movimientos forman una rejilla 2x2.
+    # Usamos el tamaño real detectado del botón LUCHA para
+    # calcular los saltos, así se adapta mejor a la escala.
+    col_offset = max(
+        120,
+        int(move_w * 1.04),
+    )
+
+    row_offset = max(
+        35,
+        int(move_h * 1.12),
+    )
+
+    return [
+        (first_x, first_y),
+        (first_x + col_offset, first_y),
+        (first_x, first_y + row_offset),
+        (first_x + col_offset, first_y + row_offset),
+    ]
+
+
+def detect_pp_zero_in_move(
+    hwnd: int,
+    move_x: int,
+    move_y: int,
+    move_size: tuple[int, int],
+) -> tuple[bool, float]:
+
+    frame = capture_window_client(hwnd)
+
+    frame_h, frame_w = frame.shape
+    move_w, move_h = move_size
+
+    # Buscamos "PP: 0 /" en TODA la caja del movimiento,
+    # no solo en una franja. Esto evita fallos por offsets
+    # verticales distintos entre resoluciones/zoom.
+    pad_x = max(8, int(move_w * 0.08))
+    pad_y = max(6, int(move_h * 0.15))
+
+    x1 = max(
+        0,
+        move_x - move_w // 2 - pad_x,
+    )
+
+    x2 = min(
+        frame_w,
+        move_x + move_w // 2 + pad_x,
+    )
+
+    y1 = max(
+        0,
+        move_y - move_h // 2 - pad_y,
+    )
+
+    y2 = min(
+        frame_h,
+        move_y + move_h // 2 + pad_y,
+    )
+
+    crop = frame[
+        y1:y2,
+        x1:x2,
+    ]
+
+    if crop.size == 0:
+        return False, -1.0
+
+    (
+        detected,
+        score,
+        location,
+        size,
+        scale,
+    ) = find_template_multiscale(
+        crop,
+        PP_ZERO_TEMPLATE,
+        PP_ZERO_MATCH_THRESHOLD,
+    )
+
+    return detected, score
+
+
+def choose_move_with_pp(
+    hwnd: int,
+    first_x: int,
+    first_y: int,
+    move_size: tuple[int, int],
+) -> bool:
+
+    positions = get_move_positions(
+        first_x,
+        first_y,
+        move_size,
+    )
+
+    print(
+        f"[PP] Revisando movimientos... "
+        f"(umbral zero={PP_ZERO_MATCH_THRESHOLD:.2f})"
+    )
+
+    for index, (x, y) in enumerate(
+        positions,
+        start=1,
+    ):
+
+        pp_zero, score = detect_pp_zero_in_move(
+            hwnd,
+            x,
+            y,
+            move_size,
+        )
+
+        print(
+            f"[PP] Movimiento {index}: "
+            f"zero={pp_zero} score={score:.3f}"
+        )
+
+        if pp_zero:
+            print(
+                f"[PP] Movimiento {index} sin PP, "
+                "probando siguiente..."
+            )
+            continue
+
+        print(
+            f"[PP] Usando movimiento {index} "
+            f"x={x} y={y}"
+        )
+
+        window_click(
+            hwnd,
+            x,
+            y,
+        )
+
+        return True
+
+    print(
+        "[PP] Los 4 movimientos parecen estar a 0 PP."
+    )
+
+    return False
 
 
 # =========================================================
@@ -1152,21 +1323,34 @@ def attack(
     )
 
     # -----------------------------------------------------
-    # PRIMER MOVIMIENTO
+    # MOVIMIENTO CON PP DISPONIBLE
     # -----------------------------------------------------
 
     print(
-        "[2] CLICK PRIMER MOVIMIENTO "
-        f"x={battle_x} "
-        f"y={battle_y}"
+        "[2] BUSCANDO MOVIMIENTO CON PP..."
     )
 
-    # En tu interfaz aparece donde estaba LUCHA.
-    window_click(
+    time.sleep(
+        PP_CHECK_WAIT
+    )
+
+    move_selected = choose_move_with_pp(
         hwnd,
         battle_x,
         battle_y,
+        battle_size,
     )
+
+    if not move_selected:
+        print(
+            "[PP] No se pudo seleccionar ningun movimiento."
+        )
+
+        time.sleep(
+            AFTER_MOVE_CLICK_BEFORE_HORDE
+        )
+
+        return
 
     time.sleep(
         AFTER_MOVE_CLICK_BEFORE_HORDE
