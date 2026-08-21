@@ -21,6 +21,11 @@ import win32process
 
 WINDOW_TITLE = "PokeMMO"
 
+# Busqueda/recuperacion de ventana
+WINDOW_FIND_RETRIES = 20
+WINDOW_FIND_DELAY = 0.50
+WINDOW_RECOVERY_DELAY = 1.00
+
 # Movimiento
 MOVE_LEFT = "a"
 MOVE_RIGHT = "d"
@@ -174,11 +179,8 @@ PP_ZERO_TEMPLATE = load_template(
 # BUSCAR POKEMMO
 # =========================================================
 
-def find_pokemmo_window() -> int:
+def find_pokemmo_window_once() -> int | None:
     candidates = []
-
-    print("\nBuscando ventanas de PokeMMO...")
-    print("-----------------------------------------")
 
     def callback(hwnd, extra):
         if not win32gui.IsWindow(hwnd):
@@ -206,55 +208,51 @@ def find_pokemmo_window() -> int:
                 width = 0
                 height = 0
 
-            search_text = (
-                title
-                + " "
-                + class_name
-                + " "
-                + process_name
-            ).lower()
-
-            if (
-                "pokemmo" in search_text
-                or "pokemon" in search_text
-            ):
-                print(
-                    f"HWND={hwnd} | "
-                    f"PID={pid} | "
-                    f"EXE='{process_name}' | "
-                    f"TITLE='{title}' | "
-                    f"CLASS='{class_name}' | "
-                    f"{width}x{height}"
-                )
-
+            # Ignoramos ventanitas auxiliares demasiado pequenas.
             if width < 400 or height < 300:
                 return
 
+            title_l = title.lower()
+            class_l = class_name.lower()
+            process_l = process_name.lower()
+
             score = 0
 
-            if "pokemmo" in title.lower():
-                score += 100
+            # El proceso es la señal más fiable.
+            if "pokemmo" in process_l:
+                score += 250
 
-            if "pokemmo" in process_name.lower():
-                score += 100
+            # El título puede cambiar o quedar vacío temporalmente.
+            if "pokemmo" in title_l:
+                score += 120
 
-            if "pokemmo" in class_name.lower():
-                score += 50
+            # Algunas versiones/clientes pueden exponer una clase útil.
+            if "pokemmo" in class_l:
+                score += 80
 
-            if "pokemon" in title.lower():
+            if "pokemon" in title_l:
                 score += 40
 
-            if "java" in process_name.lower():
+            # Fallback para clientes Java/LWJGL.
+            if "java" in process_l:
+                score += 15
+
+            # Ventana visible suma, pero NO es requisito.
+            if win32gui.IsWindowVisible(hwnd):
                 score += 10
 
-            if win32gui.IsWindowVisible(hwnd):
-                score += 5
+            # Preferimos ventanas grandes, porque normalmente son el juego.
+            score += min(
+                30,
+                int((width * height) / 250000)
+            )
 
             if score > 0:
                 candidates.append(
                     (
                         score,
                         hwnd,
+                        pid,
                         title,
                         process_name,
                         class_name,
@@ -272,51 +270,7 @@ def find_pokemmo_window() -> int:
     )
 
     if not candidates:
-        print("\nNo se encontro automaticamente.")
-        print("Mostrando ventanas grandes para diagnostico:\n")
-
-        def debug_callback(hwnd, extra):
-            try:
-                if not win32gui.IsWindow(hwnd):
-                    return
-
-                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-                width = right - left
-                height = bottom - top
-
-                if width < 600 or height < 400:
-                    return
-
-                title = win32gui.GetWindowText(hwnd)
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-
-                try:
-                    exe = psutil.Process(pid).name()
-                except Exception:
-                    exe = "?"
-
-                class_name = win32gui.GetClassName(hwnd)
-
-                print(
-                    f"HWND={hwnd} | "
-                    f"EXE='{exe}' | "
-                    f"TITLE='{title}' | "
-                    f"CLASS='{class_name}' | "
-                    f"{width}x{height}"
-                )
-
-            except Exception:
-                pass
-
-        win32gui.EnumWindows(
-            debug_callback,
-            None,
-        )
-
-        raise RuntimeError(
-            "No se encontro PokeMMO automaticamente. "
-            "Mira la lista de ventanas mostrada arriba."
-        )
+        return None
 
     candidates.sort(
         key=lambda item: item[0],
@@ -326,6 +280,7 @@ def find_pokemmo_window() -> int:
     (
         score,
         hwnd,
+        pid,
         title,
         exe,
         class_name,
@@ -333,15 +288,128 @@ def find_pokemmo_window() -> int:
         height,
     ) = candidates[0]
 
-    print("\nPokeMMO encontrado:")
-    print(f"  HWND   : {hwnd}")
-    print(f"  EXE    : {exe}")
-    print(f"  TITULO : {title}")
-    print(f"  CLASE  : {class_name}")
-    print(f"  TAMANO : {width}x{height}")
-    print(f"  SCORE  : {score}")
+    print(
+        "[WINDOW] Candidato seleccionado: "
+        f"HWND={hwnd} | PID={pid} | "
+        f"EXE='{exe}' | TITLE='{title}' | "
+        f"CLASS='{class_name}' | "
+        f"{width}x{height} | score={score}"
+    )
 
     return hwnd
+
+
+def print_large_windows_debug() -> None:
+    print(
+        "\n[WINDOW] No se encontro PokeMMO. "
+        "Ventanas grandes detectadas:"
+    )
+
+    def debug_callback(hwnd, extra):
+        try:
+            if not win32gui.IsWindow(hwnd):
+                return
+
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+            width = right - left
+            height = bottom - top
+
+            if width < 600 or height < 400:
+                return
+
+            title = win32gui.GetWindowText(hwnd)
+
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+
+            try:
+                exe = psutil.Process(pid).name()
+            except Exception:
+                exe = "?"
+
+            class_name = win32gui.GetClassName(hwnd)
+
+            print(
+                f"  HWND={hwnd} | PID={pid} | "
+                f"EXE='{exe}' | TITLE='{title}' | "
+                f"CLASS='{class_name}' | "
+                f"{width}x{height}"
+            )
+
+        except Exception:
+            pass
+
+    win32gui.EnumWindows(
+        debug_callback,
+        None,
+    )
+
+
+def find_pokemmo_window(
+    retries: int = WINDOW_FIND_RETRIES,
+    delay: float = WINDOW_FIND_DELAY,
+) -> int:
+
+    print("\nBuscando ventana de PokeMMO...")
+
+    for attempt in range(1, retries + 1):
+
+        hwnd = find_pokemmo_window_once()
+
+        if hwnd is not None:
+            print(
+                f"[WINDOW] PokeMMO encontrado "
+                f"en intento {attempt}/{retries}"
+            )
+            return hwnd
+
+        print(
+            f"[WINDOW] No encontrado "
+            f"({attempt}/{retries})"
+        )
+
+        time.sleep(delay)
+
+    print_large_windows_debug()
+
+    raise RuntimeError(
+        "No se pudo encontrar PokeMMO "
+        "despues de varios intentos."
+    )
+
+
+def recover_pokemmo_window() -> int:
+    """
+    Reintenta localizar la ventana si el HWND anterior deja de existir.
+    No termina el bot inmediatamente.
+    """
+
+    print(
+        "\n[WINDOW] Se perdio la ventana de PokeMMO. "
+        "Intentando recuperarla..."
+    )
+
+    while True:
+
+        if keyboard.is_pressed(EXIT_KEY):
+            raise KeyboardInterrupt
+
+        hwnd = find_pokemmo_window_once()
+
+        if hwnd is not None:
+            print(
+                f"[WINDOW] Ventana recuperada. HWND={hwnd}"
+            )
+            return hwnd
+
+        print(
+            "[WINDOW] PokeMMO aun no disponible; "
+            "reintentando..."
+        )
+
+        time.sleep(
+            WINDOW_RECOVERY_DELAY
+        )
 
 # =========================================================
 # INFORMACION DE VENTANA
@@ -1482,7 +1550,8 @@ def main() -> None:
 
     print(
         f"Buscando ventana: "
-        f"{WINDOW_TITLE}"
+        f"{WINDOW_TITLE} "
+        f"(hasta {WINDOW_FIND_RETRIES} intentos)"
     )
 
     hwnd = find_pokemmo_window()
@@ -1570,10 +1639,25 @@ def main() -> None:
         if not win32gui.IsWindow(
             hwnd
         ):
-            print(
-                "\nPokeMMO se ha cerrado."
+            hwnd = recover_pokemmo_window()
+
+            title = win32gui.GetWindowText(
+                hwnd
             )
-            break
+
+            client_width, client_height = (
+                get_client_size(
+                    hwnd
+                )
+            )
+
+            print(
+                "[WINDOW] Recuperada: "
+                f"{title!r} "
+                f"{client_width}x{client_height}"
+            )
+
+            continue
 
         # -------------------------------------------------
         # SALIR
